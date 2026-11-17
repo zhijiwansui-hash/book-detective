@@ -1,7 +1,7 @@
 // Vercel 서버리스 함수: POST /api/generate
 // 환경변수 GEMINI_API_KEY 에서 API 키를 읽습니다. (코드에 키를 직접 쓰지 않음)
 
-const MODEL = "gemini-2.5-flash";
+const MODEL = "gemini-3.5-flash-lite";
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
 function buildPrompt(keyword) {
