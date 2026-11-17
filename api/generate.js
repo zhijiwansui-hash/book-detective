@@ -81,12 +81,14 @@ module.exports = async function handler(req, res) {
       })
     });
 
-    if (!response.ok) {
+       if (!response.ok) {
       const detail = await response.text();
       console.error("Gemini API error:", response.status, detail);
+      let reason = "";
+      try { reason = JSON.parse(detail).error.message; } catch (e) { reason = detail.slice(0, 200); }
       return res
         .status(502)
-        .json({ error: "AI 서버 응답에 문제가 있어요. 잠시 후 다시 시도해 주세요." });
+        .json({ error: `AI 서버 오류 (${response.status}): ${reason}` });
     }
 
     const data = await response.json();
