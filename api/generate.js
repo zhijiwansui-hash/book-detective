@@ -8,8 +8,10 @@ const GEMINI_MODEL = "gemini-3.1-flash-lite";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 const PER_PAGE = 1000;
-const CACHE_MS = 6 * 60 * 60 * 1000; // 목록은 6시간 동안 서버에 보관
+const MAX_PAGES = 20;                  // 목록 페이지 수 상한(너무 오래 걸리지 않게)
+const CACHE_MS = 6 * 60 * 60 * 1000;   // 목록은 6시간 동안 서버에 보관
 const MAX_RESULTS = 6;
+const MIN_TERM_LEN = 2;                // AI가 준 단어는 2글자 이상만 사용
 
 let cache = { books: null, at: 0 };
 
@@ -63,13 +65,15 @@ async function fetchPage(page, serviceKey) {
   const res = await fetchWithTimeout(`${LIB_URL}?${qs}`, {}, 9000);
   if (!res.ok) {
     const err = new Error("library http " + res.status);
-    err.status = res.status;
+    err.status = res.status; // 401·403이면 인증 문제
     throw err;
   }
   const json = await res.json();
   if (!Array.isArray(json.data)) {
-    const err = new Error("library response: " + (json.msg || "unexpected"));
-    err.status = 401;
+    // 응답 모양이 다를 때: 메시지에 인증 관련 말이 있을 때만 인증 오류로 봄
+    const msg = String(json.msg || json.message || "unexpected");
+    const err = new Error("library response: " + msg);
+    err.status = /인증|key|키|unauthor|forbidden/i.test(msg) ? 401 : 502;
     throw err;
   }
   return json;
@@ -97,16 +101,24 @@ function normalizeRow(row) {
 async function loadBooks(serviceKey) {
   if (cache.books && Date.now() - cache.at < CACHE_MS) return cache.books;
 
+  // 첫 페이지는 꼭 성공해야 함(실패하면 인증·연결 문제)
   const first = await fetchPage(1, serviceKey);
   let rows = first.data.slice();
 
   const total = Number(first.totalCount) || rows.length;
-  const pages = Math.ceil(total / PER_PAGE);
+  const pages = Math.min(Math.ceil(total / PER_PAGE), MAX_PAGES);
+  let failedPages = 0;
+
   if (pages > 1) {
-    const rest = await Promise.all(
+    // 나머지 페이지는 일부가 실패해도 받은 것만으로 계속 진행
+    const rest = await Promise.allSettled(
       Array.from({ length: pages - 1 }, (_, i) => fetchPage(i + 2, serviceKey))
     );
-    rest.forEach((p) => { rows = rows.concat(p.data); });
+    rest.forEach((r) => {
+      if (r.status === "fulfilled") rows = rows.concat(r.value.data);
+      else failedPages += 1;
+    });
+    if (failedPages) console.error(`library: ${failedPages}개 페이지를 받지 못함`);
   }
 
   // 정리 + 같은 책(ISBN 또는 제목+저자) 중복 제거
@@ -119,18 +131,20 @@ async function loadBooks(serviceKey) {
     books.push(b);
   });
 
-  cache = { books, at: Date.now() };
+  // 빠진 페이지가 있으면 보관하지 않고 다음 요청 때 다시 받음
+  if (!failedPages) cache = { books, at: Date.now() };
   return books;
 }
 
 // ---------- Gemini: 키워드와 가까운 단어 만들기 ----------
+// 결과: { terms: [...], error: "" }  — error가 있으면 AI 없이 검색한 것
 async function expandKeyword(keyword, apiKey) {
-  if (!apiKey) return [];
+  if (!apiKey) return { terms: [], error: "GEMINI_API_KEY 없음" };
   try {
     const prompt =
       `그림책 검색을 돕는 사서입니다. 키워드 "${keyword}"와 뜻이 가깝거나 ` +
       `그림책 제목·주제에 자주 쓰이는 한국어 단어를 8개 이내로 알려주세요. ` +
-      `반드시 {"terms":["단어1","단어2"]} 형식의 JSON만 출력하세요.`;
+      `한 글자 단어는 빼고, 반드시 {"terms":["단어1","단어2"]} 형식의 JSON만 출력하세요.`;
 
     const res = await fetchWithTimeout(
       GEMINI_URL,
@@ -141,16 +155,16 @@ async function expandKeyword(keyword, apiKey) {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.3,
-            responseMimeType: "application/json",
-            thinkingConfig: { thinkingBudget: 0 }
+            responseMimeType: "application/json"
           }
         })
       },
       7000
     );
     if (!res.ok) {
-      console.error("Gemini error:", res.status, (await res.text()).slice(0, 300));
-      return [];
+      const detail = (await res.text()).slice(0, 300);
+      console.error("Gemini error:", res.status, detail);
+      return { terms: [], error: "Gemini 오류 " + res.status };
     }
     const data = await res.json();
     const parts =
@@ -158,22 +172,26 @@ async function expandKeyword(keyword, apiKey) {
         data.candidates[0].content.parts) || [];
     const text = parts.map((p) => p.text || "").join("");
     const parsed = JSON.parse(text.replace(/```json|```/gi, "").trim());
-    return (Array.isArray(parsed.terms) ? parsed.terms : [])
+    const terms = (Array.isArray(parsed.terms) ? parsed.terms : [])
       .filter((t) => typeof t === "string")
       .map((t) => t.trim())
-      .filter((t) => t.length >= 1 && t.length <= 12)
+      .filter((t) => t.length >= MIN_TERM_LEN && t.length <= 12)
+      .filter((t) => t.toLowerCase() !== keyword.toLowerCase())
       .slice(0, 8);
+    return { terms, error: terms.length ? "" : "AI가 단어를 주지 않음" };
   } catch (e) {
     console.error("Gemini expand failed:", e.message);
-    return []; // Gemini가 실패해도 키워드만으로 검색은 계속함
+    const reason = e.name === "AbortError" ? "Gemini 응답 시간 초과" : "Gemini 응답 처리 실패";
+    return { terms: [], error: reason }; // Gemini가 실패해도 키워드만으로 검색은 계속함
   }
 }
 
 // ---------- 검색 점수 계산 ----------
 function searchBooks(books, keyword, extraTerms) {
-  const terms = [{ t: keyword.toLowerCase(), w: 3 }];
+  const kw = keyword.toLowerCase();
+  const terms = [{ t: kw, w: 3 }];
   keyword.split(/\s+/).forEach((p) => {
-    if (p.length >= 2 && p.toLowerCase() !== keyword.toLowerCase()) {
+    if (p.length >= 2 && p.toLowerCase() !== kw) {
       terms.push({ t: p.toLowerCase(), w: 2 });
     }
   });
@@ -236,11 +254,16 @@ module.exports = async function handler(req, res) {
 
   try {
     // 도서관 목록 불러오기와 Gemini 단어 확장을 동시에 진행
-    const [books, extraTerms] = await Promise.all([
+    const [books, ai] = await Promise.all([
       loadBooks(libKey),
       expandKeyword(keyword, geminiKey)
     ]);
-    return res.status(200).json({ books: searchBooks(books, keyword, extraTerms) });
+    return res.status(200).json({
+      books: searchBooks(books, keyword, ai.terms),
+      aiTerms: ai.terms,          // AI가 넓혀 준 단어(비어 있으면 AI 없이 검색)
+      aiUsed: ai.terms.length > 0,
+      aiNote: ai.error            // AI를 못 쓴 이유(화면 안내용, 키 값은 들어가지 않음)
+    });
   } catch (err) {
     console.error("generate error:", err.message);
     if (err.status === 401 || err.status === 403) {
